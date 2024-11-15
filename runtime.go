@@ -1,10 +1,10 @@
 // Package utils contains all utility functions that currently have no better home than here.
 package utils
 
-// This code originally comes from https://github.com/viamrobotics/goutils/blob/fadaa66af715d712feea4e3637cecd12ed4b742b/runtime.go
+// The code in this package originally comes from
+// https://github.com/viamrobotics/goutils/blob/fadaa66af715d712feea4e3637cecd12ed4b742b/runtime.go
 // which is Apache 2.0 licensed. The following changes are:
-// - Remove golog.Logger
-// - Use Fatalf from edaniels/golog instead of Fatal
+// - Use pure zap
 
 import (
 	"context"
@@ -17,18 +17,17 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/edaniels/golog"
-	"go.viam.com/utils"
+	"go.uber.org/zap"
 )
 
 // ContextualMain calls a main entry point function with a cancellable
 // context via SIGTERM. This should be called once per process so as
 // to not clobber the signals from Notify.
-func ContextualMain(main func(ctx context.Context, args []string, logger golog.Logger) error, logger golog.Logger) {
+func ContextualMain(main func(ctx context.Context, args []string, logger *zap.SugaredLogger) error, logger *zap.SugaredLogger) {
 	// This will only run on a successful exit due to the fatal error
 	// logic in contextualMain.
 	defer func() {
-		if err := utils.FindGoroutineLeaks(); err != nil {
+		if err := FindGoroutineLeaks(); err != nil {
 			fmt.Fprintf(os.Stderr, "goroutine leak(s) detected: %v\n", err)
 		}
 	}()
@@ -37,11 +36,16 @@ func ContextualMain(main func(ctx context.Context, args []string, logger golog.L
 
 // ContextualMainQuit is the same as ContextualMain but catches quit signals into the provided
 // context accessed via ContextMainQuitSignal.
-func ContextualMainQuit(main func(ctx context.Context, args []string, logger golog.Logger) error, logger golog.Logger) {
+func ContextualMainQuit(main func(ctx context.Context, args []string, logger *zap.SugaredLogger) error, logger *zap.SugaredLogger) {
 	contextualMain(main, true, logger)
 }
 
-func contextualMain(main func(ctx context.Context, args []string, logger golog.Logger) error, quitSignal bool, logger golog.Logger) {
+func contextualMain(main func(
+	ctx context.Context,
+	args []string,
+	logger *zap.SugaredLogger,
+) error, quitSignal bool, logger *zap.SugaredLogger,
+) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	if quitSignal {
 		quitC := make(chan os.Signal, 1)
@@ -55,11 +59,12 @@ func contextualMain(main func(ctx context.Context, args []string, logger golog.L
 	signalWatcher.Add(1)
 	defer signalWatcher.Wait()
 	defer stop()
-	utils.ManagedGo(func() {
+	ManagedGo(func() {
 		for {
-			if !utils.SelectContextOrWaitChan(ctx, usr1C) {
+			if !SelectContextOrWaitChan(ctx, usr1C) {
 				return
 			}
+			//nolint:mnd
 			buf := make([]byte, 1024)
 			for {
 				n := runtime.Stack(buf, true)
@@ -67,6 +72,7 @@ func contextualMain(main func(ctx context.Context, args []string, logger golog.L
 					buf = buf[:n]
 					break
 				}
+				//nolint:mnd
 				buf = make([]byte, 2*len(buf))
 			}
 			logger.Warn(string(buf))
@@ -75,12 +81,12 @@ func contextualMain(main func(ctx context.Context, args []string, logger golog.L
 
 	readyC := make(chan struct{})
 	readyCtx := ContextWithReadyFunc(ctx, readyC)
-	if err := utils.FilterOutError(main(readyCtx, os.Args, logger), context.Canceled); err != nil {
+	if err := FilterOutError(main(readyCtx, os.Args, logger), context.Canceled); err != nil {
 		fatalf(logger, "%+v", err)
 	}
 }
 
-var fatalf = func(logger golog.Logger, fmtstr string, args ...interface{}) {
+var fatalf = func(logger *zap.SugaredLogger, fmtstr string, args ...interface{}) {
 	logger.Fatalf(fmtstr, args...)
 }
 
@@ -158,15 +164,122 @@ func PanicCapturingGoWithCallback(f func(), callback func(err interface{})) {
 		defer func() {
 			if err := recover(); err != nil {
 				debug.PrintStack()
-				golog.Global().Errorw("panic while running function", "error", err)
+				zap.L().Sugar().Errorw("panic while running function", "error", err)
 				if callback == nil {
 					return
 				}
-				golog.Global().Infow("waiting a bit to call callback", "wait", waitDur.String())
+				zap.L().Sugar().Infow("waiting a bit to call callback", "wait", waitDur.String())
 				time.Sleep(waitDur)
 				callback(err)
 			}
 		}()
 		f()
 	}()
+}
+
+// ManagedGo keeps the given function alive in the background until
+// it terminates normally.
+func ManagedGo(f, onComplete func()) {
+	PanicCapturingGoWithCallback(func() {
+		defer func() {
+			if err := recover(); err == nil && onComplete != nil {
+				onComplete()
+			} else if err != nil {
+				// re-panic
+				panic(err)
+			}
+		}()
+		f()
+	}, func(_ interface{}) {
+		ManagedGo(f, onComplete)
+	})
+}
+
+// SelectContextOrWait either terminates because the given context is done
+// or the given duration elapses. It returns true if the duration elapsed.
+func SelectContextOrWait(ctx context.Context, dur time.Duration) bool {
+	timer := time.NewTimer(dur)
+	defer timer.Stop()
+	return SelectContextOrWaitChan(ctx, timer.C)
+}
+
+// SelectContextOrWaitChan either terminates because the given context is done
+// or the given time channel is received on. It returns true if the channel
+// was received on.
+func SelectContextOrWaitChan[T any](ctx context.Context, c <-chan T) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-c:
+	}
+	return true
+}
+
+// SlowGoroutineWatcherAfterContext is used to monitor if a goroutine is going "slow".
+// It will first wait for the given context to be done and then kick off
+// a wait based on 'dur'. If 'dur' elapses before the cancel func is called, then
+// currently running goroutines will be dumped. The returned channel can be used to wait for
+// this background goroutine to finish.
+func SlowGoroutineWatcherAfterContext(
+	ctx context.Context,
+	dur time.Duration,
+	slowMsg string,
+	logger *zap.SugaredLogger,
+) (<-chan struct{}, func()) {
+	return slowGoroutineWatcher(ctx, dur, slowMsg, logger)
+}
+
+// SlowGoroutineWatcher is used to monitor if a goroutine is going "slow".
+// It will first kick off a wait based on 'dur'. If 'dur' elapses before the cancel func is called,
+// then currently running goroutines will be dumped. The returned channel can be used to wait for
+// this background goroutine to finish.
+func SlowGoroutineWatcher(
+	dur time.Duration,
+	slowMsg string,
+	logger *zap.SugaredLogger,
+) (<-chan struct{}, func()) {
+	//nolint:staticcheck
+	return slowGoroutineWatcher(nil, dur, slowMsg, logger)
+}
+
+func slowGoroutineWatcher(
+	ctx context.Context,
+	dur time.Duration,
+	slowMsg string,
+	logger *zap.SugaredLogger,
+) (<-chan struct{}, func()) {
+	slowWatcher := make(chan struct{})
+	slowWatcherCtx, slowWatcherCancel := context.WithCancel(context.Background())
+	PanicCapturingGo(func() {
+		defer close(slowWatcher)
+		if ctx != nil {
+			select {
+			case <-ctx.Done():
+			case <-slowWatcherCtx.Done():
+				return
+			}
+		}
+		if !SelectContextOrWait(slowWatcherCtx, dur) {
+			return
+		}
+
+		//nolint:mnd
+		buf := make([]byte, 1024)
+		for {
+			n := runtime.Stack(buf, true)
+			if n < len(buf) {
+				buf = buf[:n]
+				break
+			}
+			//nolint:mnd
+			buf = make([]byte, 2*len(buf))
+		}
+		logger.Warn(slowMsg, "\n", string(buf))
+	})
+	return slowWatcher, slowWatcherCancel
 }
