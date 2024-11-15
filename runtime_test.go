@@ -196,6 +196,29 @@ func TestSelectContextOrWaitChan(t *testing.T) {
 	test.That(t, ok, test.ShouldBeTrue)
 }
 
+func TestSelectContextOrWaitChanVal(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	timer := time.NewTimer(time.Second)
+	timer.Stop()
+	_, ok := SelectContextOrWaitChanVal(ctx, timer.C)
+	test.That(t, ok, test.ShouldBeFalse)
+
+	ctx, cancel = context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(time.Second)
+		cancel()
+	}()
+	_, ok = SelectContextOrWaitChanVal(ctx, timer.C)
+	test.That(t, ok, test.ShouldBeFalse)
+
+	timer = time.NewTimer(time.Second)
+	defer timer.Stop()
+	val, ok := SelectContextOrWaitChanVal(context.Background(), timer.C)
+	test.That(t, ok, test.ShouldBeTrue)
+	test.That(t, val, test.ShouldNotBeZeroValue)
+}
+
 func TestManagedGo(t *testing.T) {
 	dieCount := 3
 	done := make(chan struct{})

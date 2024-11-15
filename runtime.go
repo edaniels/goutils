@@ -204,7 +204,7 @@ func SelectContextOrWait(ctx context.Context, dur time.Duration) bool {
 }
 
 // SelectContextOrWaitChan either terminates because the given context is done
-// or the given time channel is received on. It returns true if the channel
+// or the given channel is received on. It returns true if the channel
 // was received on.
 func SelectContextOrWaitChan[T any](ctx context.Context, c <-chan T) bool {
 	select {
@@ -218,6 +218,24 @@ func SelectContextOrWaitChan[T any](ctx context.Context, c <-chan T) bool {
 	case <-c:
 	}
 	return true
+}
+
+// SelectContextOrWaitChanVal either terminates because the given context is done
+// or the given channel has a value on it. It returns true if the channel
+// was received on.
+func SelectContextOrWaitChanVal[T any](ctx context.Context, c <-chan T) (T, bool) {
+	var zero T
+	select {
+	case <-ctx.Done():
+		return zero, false
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return zero, false
+	case v := <-c:
+		return v, true
+	}
 }
 
 // SlowGoroutineWatcherAfterContext is used to monitor if a goroutine is going "slow".
